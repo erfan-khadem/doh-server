@@ -1,0 +1,26 @@
+{
+  "listen_addr": "127.0.0.1:8053",
+  "tls_cert": "",
+  "tls_key": "",
+  "upstream_dns": "8.8.8.8:53",
+  "cache_ttl_sec": 0,
+  "allowed_domains": [
+    "example.com",
+    "myservice.internal",
+    "api.example.org"
+  ],
+  "ip_range_rules": [
+    {
+      "domain": "myservice.internal",
+      "cidr": "10.10.0.0/16",
+      "count": 3,
+      "ttl": 30
+    },
+    {
+      "domain": "api.example.org",
+      "cidr": "192.168.50.0/24",
+      "count": 1,
+      "ttl": 60
+    }
+  ]
+}
