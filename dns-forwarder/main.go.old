@@ -1,0 +1,189 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"math/rand"
+	"net"
+	"strings"
+	"time"
+
+	"github.com/miekg/dns"
+)
+
+var (
+	targetTCPDNS []string
+	connPool     []chan *dns.Conn
+	successCnt   []int64
+	failureCnt   []int64
+)
+
+// getConn retrieves an idle connection from the pool, or creates a new one
+func getConn(poolNum int) (*dns.Conn, error) {
+	select {
+	case conn := <-connPool[poolNum]:
+		return conn, nil
+	default:
+		// Pool is empty, dial a new TCP connection
+		conn, err := dns.DialTimeout("tcp", targetTCPDNS[poolNum], 350*time.Millisecond)
+		if err != nil {
+			return nil, err
+		}
+
+		// Enable TCP Keepalive on the underlying socket
+		if tcpConn, ok := conn.Conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(1 * time.Minute)
+		}
+		return conn, nil
+	}
+}
+
+// putConn returns a healthy connection back to the pool
+func putConn(poolNum int, conn *dns.Conn) {
+	select {
+	case connPool[poolNum] <- conn:
+		// Successfully returned to pool
+	default:
+		// Pool is at max capacity, close and discard the connection
+		conn.Close()
+	}
+}
+
+// forwardQuery handles the actual sending/receiving with retry logic
+func forwardQuery(r *dns.Msg) (*dns.Msg, error) {
+	var err error
+	var resp *dns.Msg
+	var conn *dns.Conn
+
+	// Try up to 2 times.
+	// Why? If a connection sat idle in the pool and the upstream server silently
+	// closed it, the first attempt will fail. The second attempt will pull a
+	// different/fresh connection and succeed.
+	for i := 0; i < len(targetTCPDNS); i++ {
+		conn, err = getConn(i)
+		failureCnt[i] += 1
+		if err != nil {
+			continue // Failed to connect, try again
+		}
+
+		// Set a deadline so a stalled connection doesn't block our proxy forever
+		conn.SetDeadline(time.Now().Add(450 * time.Millisecond))
+
+		// Write the request
+		if err = conn.WriteMsg(r); err != nil {
+			conn.Close() // Connection is broken, discard it
+			continue
+		}
+
+		// Read the response
+		resp, err = conn.ReadMsg()
+		if err != nil {
+			conn.Close() // Connection is broken, discard it
+			continue
+		}
+
+		if len(resp.Answer) == 0 {
+			err = fmt.Errorf("Empty Response from Server %d", i+1)
+			continue
+		}
+
+		// Success! Put the healthy connection back into the pool and return
+		successCnt[i] += 1
+		failureCnt[i] -= 1
+		putConn(i, conn)
+		return resp, nil
+	}
+
+	return nil, err
+}
+
+func randomizeCase(s string) string {
+	result := []rune{}
+	for _, r := range s {
+		if rand.Float64() < 0.5 { // 50% chance to change case
+			if r >= 'a' && r <= 'z' {
+				result = append(result, r-'a'+'A') // Convert lowercase to uppercase
+			} else if r >= 'A' && r <= 'Z' {
+				result = append(result, r-'A'+'a') // Convert uppercase to lowercase
+			} else {
+				result = append(result, r) // Keep non-alphabetic characters as they are.
+			}
+		} else {
+			result = append(result, r) // Keep the original case if not changed.
+		}
+	}
+	return string(result)
+}
+
+func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
+	/*
+		for idx, q := range r.Question {
+			r.Question[idx].Name = randomizeCase(q.Name)
+		}
+	*/
+	resp, err := forwardQuery(r)
+	if err != nil {
+		log.Printf("Failed to forward query for %s: %v", r.Question[0].Name, err)
+		m := new(dns.Msg)
+		m.SetRcode(r, dns.RcodeServerFailure)
+		w.WriteMsg(m)
+		return
+	} else {
+		log.Printf("SUCCESS")
+	}
+
+	// Ensure the response ID matches the requester's original ID
+	resp.Id = r.Id
+
+	// Send back to the UDP client
+	err = w.WriteMsg(resp)
+	if err != nil {
+		log.Printf("Failed to send response back to client: %v", err)
+	}
+}
+
+func main() {
+	listenAddr := flag.String("listen", ":5353", "Local UDP address to listen on")
+	targetAddr := flag.String("target", "8.8.8.8:53", "Upstream target TCP DNS server (IP:port)")
+	poolSize := flag.Int("pool", 5, "Number of concurrent TCP connections to keep open")
+	flag.Parse()
+
+	//rand.Seed(time.Now().UnixNano()) // Seed the random number generator for different results each run
+
+	//targetTCPDNS = *targetAddr
+	targetAddrStr := *targetAddr
+	targetTCPDNS = strings.Split(targetAddrStr, ";")
+
+	// Initialize a buffered channel to act as our connection pool
+	connPool = make([]chan *dns.Conn, 0)
+	successCnt = make([]int64, len(targetTCPDNS))
+	failureCnt = make([]int64, len(targetTCPDNS))
+	for i := 0; i < len(targetTCPDNS); i++ {
+		successCnt[i] = 0
+		failureCnt[i] = 0
+		connPool = append(connPool, make(chan *dns.Conn, *poolSize))
+	}
+
+	dns.HandleFunc(".", handleDNSRequest)
+
+	server := &dns.Server{
+		Addr: *listenAddr,
+		Net:  "udp",
+	}
+
+	log.Printf("Starting DNS proxy: UDP %s -> TCP %s (Pool size: %d)\n", *listenAddr, targetTCPDNS, *poolSize)
+
+	go func() {
+		for {
+			time.Sleep(5 * time.Second)
+			fmt.Printf("Success: %v\nFailure: %v\n", successCnt, failureCnt)
+		}
+	}()
+
+	err := server.ListenAndServe()
+	if err != nil {
+		log.Fatalf("Failed to start server: %v\n", err)
+	}
+}
